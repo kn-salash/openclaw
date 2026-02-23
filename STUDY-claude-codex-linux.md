@@ -329,6 +329,72 @@ type ProviderUsageSnapshot = {
 
 ---
 
+## 11. PHP Integration Guide
+
+OpenClaw's architecture can be replicated in PHP. A complete proof-of-concept
+lives at [`docs/php-integration-guide.php`](docs/php-integration-guide.php).
+
+### Common Pitfalls When Integrating from PHP
+
+| Pitfall | Why It Happens | OpenClaw Pattern | PHP Solution |
+|---------|---------------|-----------------|--------------|
+| Process hangs forever | CLI sends DSR (`ESC[6n`) cursor query, nobody responds | `pty-dsr.ts` strips queries, auto-replies `ESC[row;colR` | `strip_dsr_requests()` + `fwrite()` response on stdin |
+| Garbled / missing output | No PTY — Claude Code detects non-interactive pipe and changes behavior | PTY adapter via `@lydell/node-pty` | Wrap command in `script -q /dev/null -c "..."` |
+| Blocking reads prevent stdin writes | `fread()` blocks the process; can't write DSR responses while waiting | Node.js event loop with async callbacks | `stream_set_blocking(false)` + `stream_select()` loop |
+| Process runs forever | No timeout enforcement | Two-tier: `timeoutMs` (hard) + `noOutputTimeoutMs` (idle) | Check both clocks on every `stream_select()` iteration |
+| Memory grows unbounded | All output kept in one string | Dual buffer: pending (30 KB) + aggregated (200 KB) with tail-biased truncation | `ProcessSession::appendOutput()` with `capPendingBuffer()` |
+| FD / zombie leaks | Pipes not closed after process exits | `moveToFinished()` destroys all streams, removes listeners | `ProcessSession::cleanup()` closes all resources |
+| Finished sessions pile up | No cleanup of old records | `pruneFinishedSessions()` sweeper on 5-min interval with 30-min TTL | `SessionRegistry::sweep()` called lazily |
+
+### Architecture Mapping: OpenClaw (Node.js) → PHP
+
+```
+OpenClaw (Node.js)                          PHP Equivalent
+─────────────────────                       ──────────────
+ProcessSupervisor.spawn()            →      ClaudeProcessRunner::run()
+  createPtyAdapter()                 →        proc_open() + script -q wrapper
+  onStdout callback                  →        stream_select() + fread() loop
+  stripDsrRequests()                 →        strip_dsr_requests()
+  buildCursorPositionResponse()      →        build_cursor_position_response()
+  touchOutput() / noOutputTimer      →        $lastOutputTime + idle check
+  overallTimeout timer               →        $elapsed check each iteration
+  registry.add()                     →        SessionRegistry::add()
+  appendOutput()                     →        ProcessSession::appendOutput()
+  drainSession()                     →        ProcessSession::drainPending()
+  markExited() + moveToFinished()    →        SessionRegistry::markExited()
+  pruneFinishedSessions()            →        SessionRegistry::sweep()
+  killProcessTree(pid)               →        posix_kill(-$pid, SIGKILL)
+  adapter.dispose()                  →        ProcessSession::cleanup()
+```
+
+### Quick Start (PHP)
+
+```php
+require_once __DIR__ . '/docs/php-integration-guide.php';
+
+$registry = new SessionRegistry();
+$runner   = new ClaudeProcessRunner($registry, binary: 'claude');
+
+$result = $runner->run(
+    'Explain the authentication flow in this codebase',
+    '/path/to/your/project',
+    ['ANTHROPIC_API_KEY' => getenv('ANTHROPIC_API_KEY')],
+);
+
+echo $result['output'];
+// Exit code: 0, Duration: 12.4s, Truncated: no
+```
+
+### Key Requirements
+
+- **PHP 8.1+** with `proc_open` enabled
+- **`claude` CLI** installed and on PATH (or `codex` for OpenAI)
+- **`script` command** available (standard on Linux/macOS, provides PTY layer)
+- **Working directory** must be a git repo (required by Codex; recommended for Claude)
+- **Non-blocking I/O** is essential — never use raw `fread()` without `stream_set_blocking(false)`
+
+---
+
 ## File Reference Index
 
 | File | Role |
@@ -350,3 +416,4 @@ type ProviderUsageSnapshot = {
 | `src/daemon/service-env.ts` | Service environment construction |
 | `src/process/supervisor/` | Agent child process supervision |
 | `docs/platforms/linux.md` | Linux platform documentation |
+| `docs/php-integration-guide.php` | PHP proof-of-concept for PTY-based CLI integration |
